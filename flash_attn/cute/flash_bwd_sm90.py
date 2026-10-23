@@ -956,33 +956,10 @@ class FlashAttentionBackwardSm90:
             while work_tile.is_valid_tile:
                 n_block, head_idx, batch_idx, _ = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
-                if const_expr(self.ragged_kv_tma) and batch_idx != kv_desc_batch_idx:
-                    # Shrink the rows extent (mode 0) of K and V to this sequence's end: packed
-                    # layouts count absolute rows, dense layouts per-batch rows. Extents >= 1.
-                    kv_desc_batch_idx = batch_idx
-                    kv_rows_end = (
-                        seqlen.offset_k + seqlen.seqlen_k
-                        if const_expr(seqlen.has_cu_seqlens_k)
-                        else seqlen.seqlen_k
-                    )
-                    kv_rows_end = cutlass.max(kv_rows_end, 1)
-                    bounded = []
-                    for t in (mK_gmem, mV_gmem):
-                        shape = list(t.shape)
-                        shape[0] = kv_rows_end
-                        bounded.append(
-                            cute.make_tensor(
-                                t.iterator, cute.make_layout(tuple(shape), stride=t.stride)
-                            )
-                        )
-                    tensormap_manager.update_tensormap(
-                        tuple(bounded), (tma_atom_K, tma_atom_V), tensormap_gmem, 0, (None, None)
-                    )
-                    for p in tensormap_gmem:
-                        tensormap_manager.fence_tensormap_update(p)
-                        cute.arch.inline_ptx(
-                            "prefetch.tensormap [{$r0}];", read_only_args=[p.toint()]
-                        )
+                kv_desc_stale = False
+                if const_expr(self.ragged_kv_tma):
+                    kv_desc_stale = batch_idx != kv_desc_batch_idx
+
                 head_idx_kv = (
                     head_idx
                     if const_expr(self.qhead_per_kvhead == 1)
@@ -1065,11 +1042,45 @@ class FlashAttentionBackwardSm90:
                         pipeline_Q.producer_acquire(
                             producer_state_Q, extra_tx_count=self.tma_copy_bytes["K"]
                         )
-                        load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
                         load_Q(first_m_block, producer_state=producer_state_Q)
                         # Wait for bwd preprocess to finish writing LSE and dPsum
                         cute.arch.griddepcontrol_wait()
                         load_LSE(first_m_block, producer_state=producer_state_Q)
+                        if const_expr(self.ragged_kv_tma) and kv_desc_stale:
+                            # Shrink the rows extent (mode 0) of K and V to this sequence's end:
+                            # packed layouts count absolute rows, dense layouts per-batch rows
+                            # (extents >= 1). Issued after the Q / LSE loads so their TMA latency
+                            # hides the rewrite.
+                            kv_rows_end = (
+                                seqlen.offset_k + seqlen.seqlen_k
+                                if const_expr(seqlen.has_cu_seqlens_k)
+                                else seqlen.seqlen_k
+                            )
+                            kv_rows_end = cutlass.max(kv_rows_end, 1)
+                            bounded = []
+                            for t in (mK_gmem, mV_gmem):
+                                shape = list(t.shape)
+                                shape[0] = kv_rows_end
+                                bounded.append(
+                                    cute.make_tensor(
+                                        t.iterator,
+                                        cute.make_layout(tuple(shape), stride=t.stride),
+                                    )
+                                )
+                            tensormap_manager.update_tensormap(
+                                tuple(bounded),
+                                (tma_atom_K, tma_atom_V),
+                                tensormap_gmem,
+                                0,
+                                (None, None),
+                            )
+                            for p in tensormap_gmem:
+                                tensormap_manager.fence_tensormap_update(p)
+                                cute.arch.inline_ptx(
+                                    "prefetch.tensormap [{$r0}];", read_only_args=[p.toint()]
+                                )
+                            kv_desc_batch_idx = batch_idx
+                        load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
                         producer_state_dO_cur = (
                             producer_state_dO
                             if const_expr(self.Q_stage != self.dO_stage)
@@ -1078,9 +1089,9 @@ class FlashAttentionBackwardSm90:
                         pipeline_dO.producer_acquire(
                             producer_state_dO_cur, extra_tx_count=self.tma_copy_bytes["V"]
                         )
-                        load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_cur))
                         load_dO(first_m_block, producer_state=producer_state_dO_cur)
                         load_dPsum(first_m_block, producer_state=producer_state_dO_cur)
+                        load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_cur))
                         producer_state_Q.advance()
                         producer_state_dO.advance()
 
@@ -1099,6 +1110,40 @@ class FlashAttentionBackwardSm90:
                             producer_state_Q.advance()
                             producer_state_dO.advance()
                     else:
+                        if const_expr(self.ragged_kv_tma) and kv_desc_stale:
+                            # Shrink the rows extent (mode 0) of K and V to this sequence's end:
+                            # packed layouts count absolute rows, dense layouts per-batch rows
+                            # (extents >= 1). Issued after the Q / LSE loads so their TMA latency
+                            # hides the rewrite.
+                            kv_rows_end = (
+                                seqlen.offset_k + seqlen.seqlen_k
+                                if const_expr(seqlen.has_cu_seqlens_k)
+                                else seqlen.seqlen_k
+                            )
+                            kv_rows_end = cutlass.max(kv_rows_end, 1)
+                            bounded = []
+                            for t in (mK_gmem, mV_gmem):
+                                shape = list(t.shape)
+                                shape[0] = kv_rows_end
+                                bounded.append(
+                                    cute.make_tensor(
+                                        t.iterator,
+                                        cute.make_layout(tuple(shape), stride=t.stride),
+                                    )
+                                )
+                            tensormap_manager.update_tensormap(
+                                tuple(bounded),
+                                (tma_atom_K, tma_atom_V),
+                                tensormap_gmem,
+                                0,
+                                (None, None),
+                            )
+                            for p in tensormap_gmem:
+                                tensormap_manager.fence_tensormap_update(p)
+                                cute.arch.inline_ptx(
+                                    "prefetch.tensormap [{$r0}];", read_only_args=[p.toint()]
+                                )
+                            kv_desc_batch_idx = batch_idx
                         # The wait for bwd preprocess that the dense arm above does inline sits
                         # in _load_q_do_block_sm90, at the same point in the load order.
                         producer_state_Q, producer_state_dO = produce_block_sparse_q_loads_bwd_sm90(
